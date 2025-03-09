@@ -8,11 +8,17 @@ import pathlib
 import json
 import requests
 from pinai_agent_sdk import PINAIAgentSDK, AGENT_CATEGORY_SOCIAL
+from amazon_paapi import AmazonApi
+import re
 
 # Load environment variables
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PINAI_API_KEY = os.getenv("PINAI_API_KEY")
+AMAZON_KEY = os.getenv("AMAZON_KEY")
+AMAZON_SECRET = os.getenv("AMAZON_SECRET")
+AMAZON_TAG = os.getenv("AMAZON_TAG")
+AMAZON_COUNTRY = os.getenv("AMAZON_COUNTRY", "US")
 
 # Ensure API keys are available
 if not GEMINI_API_KEY:
@@ -23,8 +29,18 @@ elif not PINAI_API_KEY:
 # Initialize clients
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 pinai_client = None
+amazon_client = None
+
 if PINAI_API_KEY:
     pinai_client = PINAIAgentSDK(api_key=PINAI_API_KEY)
+
+if AMAZON_KEY and AMAZON_SECRET and AMAZON_TAG:
+    try:
+        amazon_client = AmazonApi(AMAZON_KEY, AMAZON_SECRET, AMAZON_TAG, AMAZON_COUNTRY, throttling=1)
+    except Exception as e:
+        st.warning(f"Failed to initialize Amazon API: {str(e)}")
+else:
+    st.warning("Amazon API credentials not found. Product search will be disabled.")
 
 # Function to fetch Twitter style data through PinAI
 def get_twitter_style_data(username):
@@ -33,19 +49,15 @@ def get_twitter_style_data(username):
         return None
     
     try:
-        # Use PinAI data connector for Twitter
-        connector_params = {
-            "username": username,
-            "data_types": ["tweets", "liked_tweets", "user_info"],
-            "filters": {"categories": ["fashion", "clothing", "outfits"], "count": 50}
-        }
-        
         # Log the attempt to connect
         st.info(f"Attempting to fetch Twitter data for @{username}...")
         
-        # In a real implementation, we would use the actual PinAI API
-        # For now, simulate a successful response with fashion preferences
-        # since the exact API method for data connectors isn't documented yet
+        # In a production implementation, we would connect to Twitter via PinAI's data connectors
+        # Since we're still in development mode, we'll use a simulated response for demonstration
+        
+        # Start a PinAI agent session to access Twitter data
+        # This is a placeholder and would need to be updated based on PinAI's official documentation
+        # as their Twitter connector API becomes more defined
         
         # Simulated response for demonstration
         simulated_data = {
@@ -97,6 +109,80 @@ def enhance_prompt_with_twitter_data(base_prompt, twitter_data):
     
     return base_prompt
 
+def extract_search_terms(recommendation_text):
+    """Extract key fashion items from recommendation text for Amazon search"""
+    # Create a specific prompt to identify key items
+    prompt = f"""
+    Extract only the main fashion items mentioned in this outfit recommendation. 
+    Format as a comma-separated list of specific search terms for Amazon. 
+    Focus on individual items (like "black leather jacket" or "white sneakers"), 
+    not styles or outfit concepts.
+    
+    RECOMMENDATION TEXT:
+    {recommendation_text}
+    
+    ITEMS:
+    """
+    
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-2.0-flash-exp",
+            contents=prompt
+        )
+        
+        search_terms = response.text.strip()
+        # Split by commas and clean up
+        return [term.strip() for term in search_terms.split(',') if term.strip()]
+    except Exception as e:
+        st.error(f"Error extracting search terms: {str(e)}")
+        # Fallback: try basic extraction with regex
+        items = re.findall(r'([\w\s]+(?:jacket|shirt|pants|shoes|dress|hat|sweater|jeans|boots|sneakers|coat))', recommendation_text.lower())
+        return [item.strip() for item in items if len(item.strip()) > 5]
+
+def search_amazon_products(search_term, limit=3):
+    """Search for products on Amazon using the Product Advertising API"""
+    if not amazon_client:
+        return None
+    
+    try:
+        # Search for products
+        search_result = amazon_client.search_items(keywords=search_term, search_index="All")
+        
+        # Extract relevant product information
+        products = []
+        for i, item in enumerate(search_result.items[:limit]):
+            if i >= limit:
+                break
+                
+            product = {
+                'title': getattr(item.item_info.title, 'display_value', 'No title available'),
+                'url': item.detail_page_url,
+                'price': None,
+                'image': None,
+                'rating': None
+            }
+            
+            # Get price if available
+            if hasattr(item, 'offers') and item.offers and item.offers.listings:
+                price_info = item.offers.listings[0].price
+                if hasattr(price_info, 'amount'):
+                    product['price'] = f"{price_info.currency} {price_info.amount}"
+            
+            # Get image if available
+            if hasattr(item, 'images') and item.images and item.images.primary:
+                product['image'] = item.images.primary.large.url
+            
+            # Get rating if available
+            if hasattr(item.item_info, 'by_line_info'):
+                product['rating'] = getattr(item.item_info.by_line_info, 'brand', {}).get('display_value', None)
+            
+            products.append(product)
+        
+        return products
+    except Exception as e:
+        st.error(f"Error searching Amazon: {str(e)}")
+        return None
+
 # Streamlit UI
 st.title("Personalized Image Analysis & Outfit Recommendation")
 
@@ -142,7 +228,8 @@ if uploaded_file is not None:
                 image_data = pathlib.Path(img_path).read_bytes()
                 
                 # Create base prompt
-                base_prompt = "Analyze this person's outfit and provide a recommendation."
+                base_prompt = ("Analyze this person's outfit and provide a recommendation. "
+                              "Be specific about individual clothing items that would complement this outfit.")
                 
                 # Enhance prompt with Twitter data if available
                 twitter_data = st.session_state.get("twitter_data", None)
@@ -166,13 +253,54 @@ if uploaded_file is not None:
                     ]
                 )
 
+                recommendation_text = response.text if response else "No response received."
+                
                 # Display recommendation
                 st.subheader("Personalized Recommendation:")
-                st.write(response.text if response else "No response received.")
+                st.write(recommendation_text)
                 
                 if st.session_state.get("using_personalization", False):
                     st.info("This recommendation has been tailored based on your Twitter style preferences.")
-            
+                
+                # Extract search terms and search Amazon
+                if amazon_client and recommendation_text:
+                    st.subheader("Find Similar Products:")
+                    search_terms = extract_search_terms(recommendation_text)
+                    
+                    if search_terms:
+                        with st.expander("View Search Terms"):
+                            st.write(", ".join(search_terms))
+                        
+                        # Use tabs for different search terms
+                        tabs = st.tabs([f"{term[:15]}..." if len(term) > 15 else term for term in search_terms[:3]])
+                        
+                        for i, (tab, term) in enumerate(zip(tabs, search_terms[:3])):
+                            with tab:
+                                with st.spinner(f"Searching for {term}..."):
+                                    products = search_amazon_products(term)
+                                    
+                                    if products:
+                                        for j, product in enumerate(products):
+                                            col1, col2 = st.columns([1, 3])
+                                            with col1:
+                                                if product['image']:
+                                                    st.image(product['image'], width=100)
+                                                else:
+                                                    st.write("No image available")
+                                            
+                                            with col2:
+                                                st.markdown(f"**{product['title']}**")
+                                                if product['price']:
+                                                    st.write(f"Price: {product['price']}")
+                                                st.markdown(f"[View on Amazon]({product['url']})")
+                                            
+                                            if j < len(products) - 1:
+                                                st.divider()
+                                    else:
+                                        st.write(f"No products found for '{term}'")
+                    else:
+                        st.info("No specific items identified for product search.")
+                
             except Exception as e:
                 st.error(f"Error: {str(e)}")
 
