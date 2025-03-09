@@ -4,6 +4,11 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 import PIL.Image
+import pathlib
+
+# Load environment variables
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Ensure API key is available
 if not GEMINI_API_KEY:
@@ -29,14 +34,19 @@ if uploaded_file is not None:
     if st.button("Analyze Image"):
         with st.spinner("Uploading image & analyzing..."):
             try:
-                # Upload the image to Gemini API
-                file_ref = client.files.upload(file=img_path)
-                st.success("Image uploaded successfully!")  # Hide unnecessary details
-
+                # Read the image file as bytes
+                image_data = pathlib.Path(img_path).read_bytes()
+                
                 # Generate content based on the uploaded image
                 response = client.models.generate_content(
                     model="gemini-2.0-flash-exp",
-                    contents=["Analyze this person's outfit and provide a recommendation.", file_ref]
+                    contents=[
+                        "Analyze this person's outfit and provide a recommendation.",
+                        types.Part.from_bytes(
+                            data=image_data,
+                            mime_type="image/jpeg"
+                        )
+                    ]
                 )
 
                 # Display recommendation
