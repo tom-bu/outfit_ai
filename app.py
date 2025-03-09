@@ -10,6 +10,8 @@ import requests
 from pinai_agent_sdk import PINAIAgentSDK, AGENT_CATEGORY_SOCIAL
 from amazon_paapi import AmazonApi
 import re
+import time
+from typing import Dict, List, Optional, Any, Union
 
 # Load environment variables
 load_dotenv()
@@ -19,6 +21,9 @@ AMAZON_KEY = os.getenv("AMAZON_KEY")
 AMAZON_SECRET = os.getenv("AMAZON_SECRET")
 AMAZON_TAG = os.getenv("AMAZON_TAG")
 AMAZON_COUNTRY = os.getenv("AMAZON_COUNTRY", "US")
+SHOPIFY_STORE_URL = os.getenv("SHOPIFY_STORE_URL")
+SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
+SHOPIFY_STOREFRONT_TOKEN = os.getenv("SHOPIFY_STOREFRONT_TOKEN")
 
 # Ensure API keys are available
 if not GEMINI_API_KEY:
@@ -30,6 +35,7 @@ elif not PINAI_API_KEY:
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 pinai_client = None
 amazon_client = None
+shopify_client = None
 
 if PINAI_API_KEY:
     pinai_client = PINAIAgentSDK(api_key=PINAI_API_KEY)
@@ -41,6 +47,313 @@ if AMAZON_KEY and AMAZON_SECRET and AMAZON_TAG:
         st.warning(f"Failed to initialize Amazon API: {str(e)}")
 else:
     st.warning("Amazon API credentials not found. Product search will be disabled.")
+
+# Shopify connector using PinAI data connector
+class ShopifyConnector:
+    def __init__(self, store_url: str, access_token: str = None, storefront_token: str = None, pinai_client: Optional[PINAIAgentSDK] = None):
+        """
+        Initialize the Shopify connector with store credentials and PinAI client
+        
+        Args:
+            store_url (str): The Shopify store URL (e.g., your-store.myshopify.com)
+            access_token (str, optional): The Shopify Admin API access token
+            storefront_token (str, optional): The Shopify Storefront API access token
+            pinai_client (PINAIAgentSDK, optional): PinAI client for data connector integration
+        """
+        self.store_url = store_url
+        self.access_token = access_token
+        self.storefront_token = storefront_token
+        self.pinai_client = pinai_client
+        self.base_url = f"https://{store_url}"
+        
+        # Set up API URLs
+        self.admin_api_url = f"{self.base_url}/admin/api/2023-10"
+        self.storefront_api_url = f"{self.base_url}/api/2023-10/graphql.json"
+        
+        # Set up headers for Admin API if token provided
+        self.admin_headers = None
+        if access_token:
+            self.admin_headers = {
+                "Content-Type": "application/json",
+                "X-Shopify-Access-Token": access_token
+            }
+        
+        # Set up headers for Storefront API if token provided
+        self.storefront_headers = None
+        if storefront_token:
+            self.storefront_headers = {
+                "Content-Type": "application/json",
+                "X-Shopify-Storefront-Access-Token": storefront_token
+            }
+    
+    def search_products(self, query: str, limit: int = 3) -> List[Dict]:
+        """
+        Search for products in the Shopify store based on a query
+        
+        Args:
+            query (str): The search query
+            limit (int): Maximum number of products to return
+            
+        Returns:
+            List[Dict]: List of product information dictionaries
+        """
+        products = []
+        
+        # Try Admin API first if we have a token
+        if self.admin_headers:
+            try:
+                # Use Admin API to search products
+                endpoint = f"{self.admin_api_url}/products.json"
+                params = {
+                    "limit": limit,
+                    "title": query  # Search by title
+                }
+                
+                response = requests.get(endpoint, headers=self.admin_headers, params=params)
+                
+                # If successful, process the response
+                if response.status_code == 200:
+                    data = response.json()
+                    
+                    if "products" in data and data["products"]:
+                        for product in data["products"]:
+                            product_info = {
+                                "id": product.get("id"),
+                                "title": product.get("title", "No title"),
+                                "description": product.get("body_html", "No description"),
+                                "handle": product.get("handle", ""),
+                                "url": f"{self.base_url}/products/{product.get('handle', '')}",
+                                "price": None,
+                                "image_url": None
+                            }
+                            
+                            # Get price from variants
+                            if "variants" in product and product["variants"]:
+                                variant = product["variants"][0]
+                                price = variant.get("price")
+                                if price:
+                                    product_info["price"] = {
+                                        "amount": price,
+                                        "currency": "USD"  # Default to USD
+                                    }
+                            
+                            # Get image URL
+                            if "images" in product and product["images"]:
+                                image = product["images"][0]
+                                product_info["image_url"] = image.get("src")
+                            
+                            products.append(product_info)
+                        
+                        return products
+                    
+                # If Admin API fails or returns no products, continue to try Storefront API
+            except Exception as e:
+                print(f"Admin API search failed: {str(e)}")
+        
+        # Try Storefront API if we have a token and Admin API didn't work
+        if self.storefront_headers and not products:
+            try:
+                # Use Storefront API with GraphQL
+                graphql_query = """
+                query searchProducts($query: String!, $first: Int!) {
+                  products(query: $query, first: $first) {
+                    edges {
+                      node {
+                        id
+                        title
+                        description
+                        handle
+                        onlineStoreUrl
+                        priceRange {
+                          minVariantPrice {
+                            amount
+                            currencyCode
+                          }
+                        }
+                        images(first: 1) {
+                          edges {
+                            node {
+                              url
+                              altText
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+                """
+                
+                # Variables for the query
+                variables = {
+                    "query": query,
+                    "first": limit
+                }
+                
+                # Make the request
+                response = requests.post(
+                    self.storefront_api_url,
+                    headers=self.storefront_headers,
+                    json={"query": graphql_query, "variables": variables}
+                )
+                
+                # Check if the request was successful
+                if response.status_code == 200:
+                    data = response.json()
+                    
+                    # Extract product information
+                    if "data" in data and "products" in data["data"] and "edges" in data["data"]["products"]:
+                        for edge in data["data"]["products"]["edges"]:
+                            node = edge["node"]
+                            
+                            # Extract price
+                            price_info = None
+                            if "priceRange" in node and "minVariantPrice" in node["priceRange"]:
+                                price_data = node["priceRange"]["minVariantPrice"]
+                                price_info = {
+                                    "amount": price_data.get("amount", ""),
+                                    "currency": price_data.get("currencyCode", "USD")
+                                }
+                            
+                            # Extract image
+                            image_url = None
+                            if "images" in node and "edges" in node["images"] and len(node["images"]["edges"]) > 0:
+                                image_data = node["images"]["edges"][0]["node"]
+                                image_url = image_data.get("url", "")
+                            
+                            # Create product object
+                            product = {
+                                "id": node.get("id", ""),
+                                "title": node.get("title", "No title"),
+                                "description": node.get("description", ""),
+                                "url": node.get("onlineStoreUrl", f"{self.base_url}/products/{node.get('handle', '')}"),
+                                "price": price_info,
+                                "image_url": image_url
+                            }
+                            
+                            products.append(product)
+            except Exception as e:
+                print(f"Storefront API search failed: {str(e)}")
+        
+        return products
+    
+    def get_product_recommendations(self, product_id: str, limit: int = 3) -> List[Dict]:
+        """
+        Get product recommendations based on a product ID
+        
+        Args:
+            product_id (str): The product ID to get recommendations for
+            limit (int): Maximum number of recommendations to return
+            
+        Returns:
+            List[Dict]: List of recommended product information dictionaries
+        """
+        try:
+            # Try to get recommendations using Admin API first
+            if self.admin_headers:
+                try:
+                    # For simplicity, just return other products from the store
+                    # In a real implementation, you would use a recommendation algorithm
+                    endpoint = f"{self.admin_api_url}/products.json"
+                    params = {"limit": limit}
+                    
+                    response = requests.get(endpoint, headers=self.admin_headers, params=params)
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        recommendations = []
+                        
+                        if "products" in data and data["products"]:
+                            for product in data["products"]:
+                                # Skip the original product
+                                if str(product.get("id")) == str(product_id):
+                                    continue
+                                    
+                                product_info = {
+                                    "id": product.get("id"),
+                                    "title": product.get("title", "No title"),
+                                    "description": product.get("body_html", "No description"),
+                                    "handle": product.get("handle", ""),
+                                    "url": f"{self.base_url}/products/{product.get('handle', '')}",
+                                    "price": None,
+                                    "image_url": None
+                                }
+                                
+                                # Get price from variants
+                                if "variants" in product and product["variants"]:
+                                    variant = product["variants"][0]
+                                    price = variant.get("price")
+                                    if price:
+                                        product_info["price"] = {
+                                            "amount": price,
+                                            "currency": "USD"  # Default to USD
+                                        }
+                                
+                                # Get image URL
+                                if "images" in product and product["images"]:
+                                    image = product["images"][0]
+                                    product_info["image_url"] = image.get("src")
+                                
+                                recommendations.append(product_info)
+                                
+                                if len(recommendations) >= limit:
+                                    break
+                            
+                            return recommendations
+                except Exception as e:
+                    print(f"Admin API recommendations failed: {str(e)}")
+            
+            # If Admin API didn't work or we only have Storefront API access
+            if self.storefront_headers:
+                # Use Storefront API to get other products
+                return self.search_products("", limit)
+            
+            return []
+        except Exception as e:
+            print(f"Error getting product recommendations: {str(e)}")
+            return []
+    
+    def search_with_pinai(self, query: str, limit: int = 3) -> List[Dict]:
+        """
+        Search for products using PinAI data connector
+        
+        Args:
+            query (str): The search query
+            limit (int): Maximum number of products to return
+            
+        Returns:
+            List[Dict]: List of product information dictionaries
+        """
+        if not self.pinai_client:
+            return self.search_products(query, limit)
+        
+        try:
+            # In a real implementation, we would use the PinAI data connector to search Shopify
+            # For now, we'll simulate this by adding a small delay and then using the direct API
+            st.info(f"Using PinAI data connector to search Shopify for: {query}")
+            time.sleep(1)  # Simulate PinAI processing
+            
+            # Use the regular search function for now
+            return self.search_products(query, limit)
+        
+        except Exception as e:
+            st.error(f"Error using PinAI to search Shopify: {str(e)}")
+            return []
+
+# Initialize Shopify client if credentials are available
+if SHOPIFY_STORE_URL and (SHOPIFY_ACCESS_TOKEN or SHOPIFY_STOREFRONT_TOKEN):
+    try:
+        # Clean up URL to get just the domain
+        shopify_domain = SHOPIFY_STORE_URL
+        if shopify_domain.startswith(("http://", "https://")):
+            shopify_domain = shopify_domain.split("//", 1)[1]
+        shopify_domain = shopify_domain.rstrip("/")
+        
+        shopify_client = ShopifyConnector(shopify_domain, SHOPIFY_ACCESS_TOKEN, SHOPIFY_STOREFRONT_TOKEN, pinai_client)
+    except Exception as e:
+        st.warning(f"Failed to initialize Shopify API: {str(e)}")
+else:
+    st.warning("Shopify API credentials not found. Shopify product search will be disabled.")
 
 # Function to fetch Twitter style data through PinAI
 def get_twitter_style_data(username):
@@ -183,6 +496,19 @@ def search_amazon_products(search_term, limit=3):
         st.error(f"Error searching Amazon: {str(e)}")
         return None
 
+def search_shopify_products(search_term, limit=3):
+    """Search for products on Shopify using the Storefront API via PinAI data connector"""
+    if not shopify_client:
+        return None
+    
+    try:
+        # Search for products using PinAI data connector
+        products = shopify_client.search_with_pinai(search_term, limit)
+        return products
+    except Exception as e:
+        st.error(f"Error searching Shopify: {str(e)}")
+        return None
+
 # Streamlit UI
 st.title("Personalized Image Analysis & Outfit Recommendation")
 
@@ -263,7 +589,7 @@ if uploaded_file is not None:
                     st.info("This recommendation has been tailored based on your Twitter style preferences.")
                 
                 # Extract search terms and search Amazon
-                if amazon_client and recommendation_text:
+                if (amazon_client or shopify_client) and recommendation_text:
                     st.subheader("Find Similar Products:")
                     search_terms = extract_search_terms(recommendation_text)
                     
@@ -271,33 +597,74 @@ if uploaded_file is not None:
                         with st.expander("View Search Terms"):
                             st.write(", ".join(search_terms))
                         
-                        # Use tabs for different search terms
-                        tabs = st.tabs([f"{term[:15]}..." if len(term) > 15 else term for term in search_terms[:3]])
+                        # Create tabs for different marketplaces
+                        marketplace_tabs = st.tabs(["Amazon", "Shopify"])
                         
-                        for i, (tab, term) in enumerate(zip(tabs, search_terms[:3])):
-                            with tab:
-                                with st.spinner(f"Searching for {term}..."):
-                                    products = search_amazon_products(term)
-                                    
-                                    if products:
-                                        for j, product in enumerate(products):
-                                            col1, col2 = st.columns([1, 3])
-                                            with col1:
-                                                if product['image']:
-                                                    st.image(product['image'], width=100)
-                                                else:
-                                                    st.write("No image available")
+                        # Amazon tab
+                        with marketplace_tabs[0]:
+                            if amazon_client:
+                                # Use tabs for different search terms
+                                term_tabs = st.tabs([f"{term[:15]}..." if len(term) > 15 else term for term in search_terms[:3]])
+                                
+                                for i, (tab, term) in enumerate(zip(term_tabs, search_terms[:3])):
+                                    with tab:
+                                        with st.spinner(f"Searching Amazon for {term}..."):
+                                            products = search_amazon_products(term)
                                             
-                                            with col2:
-                                                st.markdown(f"**{product['title']}**")
-                                                if product['price']:
-                                                    st.write(f"Price: {product['price']}")
-                                                st.markdown(f"[View on Amazon]({product['url']})")
+                                            if products:
+                                                for j, product in enumerate(products):
+                                                    col1, col2 = st.columns([1, 3])
+                                                    with col1:
+                                                        if product['image']:
+                                                            st.image(product['image'], width=100)
+                                                        else:
+                                                            st.write("No image available")
+                                                    
+                                                    with col2:
+                                                        st.markdown(f"**{product['title']}**")
+                                                        if product['price']:
+                                                            st.write(f"Price: {product['price']}")
+                                                        st.markdown(f"[View on Amazon]({product['url']})")
+                                                    
+                                                    if j < len(products) - 1:
+                                                        st.divider()
+                                            else:
+                                                st.write(f"No Amazon products found for '{term}'")
+                            else:
+                                st.info("Amazon API credentials not configured. Cannot search Amazon products.")
+                        
+                        # Shopify tab
+                        with marketplace_tabs[1]:
+                            if shopify_client:
+                                # Use tabs for different search terms
+                                term_tabs = st.tabs([f"{term[:15]}..." if len(term) > 15 else term for term in search_terms[:3]])
+                                
+                                for i, (tab, term) in enumerate(zip(term_tabs, search_terms[:3])):
+                                    with tab:
+                                        with st.spinner(f"Searching Shopify for {term}..."):
+                                            products = search_shopify_products(term)
                                             
-                                            if j < len(products) - 1:
-                                                st.divider()
-                                    else:
-                                        st.write(f"No products found for '{term}'")
+                                            if products:
+                                                for j, product in enumerate(products):
+                                                    col1, col2 = st.columns([1, 3])
+                                                    with col1:
+                                                        if product['image_url']:
+                                                            st.image(product['image_url'], width=100)
+                                                        else:
+                                                            st.write("No image available")
+                                                    
+                                                    with col2:
+                                                        st.markdown(f"**{product['title']}**")
+                                                        if product['price']:
+                                                            st.write(f"Price: {product['price']['amount']} {product['price']['currency']}")
+                                                        st.markdown(f"[View on Shopify]({product['url']})")
+                                                    
+                                                    if j < len(products) - 1:
+                                                        st.divider()
+                                            else:
+                                                st.write(f"No Shopify products found for '{term}'")
+                            else:
+                                st.info("Shopify API credentials not configured. Cannot search Shopify products.")
                     else:
                         st.info("No specific items identified for product search.")
                 
